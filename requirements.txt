@@ -1,0 +1,19 @@
+# Core dependencies
+langchain>=0.1.0
+langchain-community>=0.0.13
+langchain-core>=0.1.10
+langchain-text-splitters>=0.0.1
+
+# Document loaders
+pypdf2>=3.0.0
+pdfminer.six>=20221105
+
+# For CLI and utilities
+tqdm>=4.66.0
+rich>=13.6.0
+
+# For OLLAMA integration
+ollama>=0.1.5
+
+# For Streamlit web app
+streamlit>=1.25.0
