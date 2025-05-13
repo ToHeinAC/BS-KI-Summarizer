@@ -19,7 +19,7 @@ from typing import Dict, List, Any, Optional
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.llms import Ollama
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain.chains.summarize import load_summarize_chain
 from langchain_core.documents import Document
 from langchain_core.callbacks import CallbackManager
@@ -85,20 +85,8 @@ class DocumentSummarizer:
             length_function=len
         )
         
-        # Define summarization templates
-        self.summarize_template = """
-        You are a master senior analyst. 
-        Your task is to create a deep research report for the information given to you, highlighting the most critical insights for decision-makers. 
-        In order to do this, YOU MUST take the full information provided to you. 
-        This can be either a full document (if the size is not too large) or a collection of ordered document chunks representing a full document (if the size indeed is large). 
-        For the case of ordered document chunks, the order is important to recognize for providing the deep research report in the sense that the order marks a consecutive story line.
-        
-        KEY POINTS:
-        YOU MUST respond in language: {language}
-        Your deep research report should be at least 5000 words.
-        Answer in correct professional terminology and sociolect maintaining exact key terms.
-
-        Follow this specific structure:
+        # Define summarization templatesBUP
+        """Follow this specific structure:
         1. Introduction (approximately 20% of summary)
            - Provide context and background
            - State the document's purpose and significance
@@ -119,29 +107,42 @@ class DocumentSummarizer:
         - Be precise and comprehensive, focusing on the most important information.
         - Maintain exact figures, data points, sections and paragraphs as much as possible.
 
-        Return your deep research report without any prefix or suffix to the summary, just your summary without any thinking passages.
-        """
-        
-        self.map_template = """You are a senior analyst helping the master senior analyst to compile the final summary of a document. 
-        In order to help the master senior analyst to compile the final summary of a document, YOU MUST summarize this section of the document in a few paragraphs maintaining all key information. 
-        MOST IMPORTANT:
-        - Summarize such that the connection to previous document chunks is taken into account.
-        - Summarize such that you REDUCE the words count of the original document which is a chunk of a larger document BY A FACTOR OF 3 TO 5.
-        - NEVER add any additional information or context that was not present in the original document.
-        - YOU MUST maintain exact figures, data points, sections and paragraphs.
-        - YOU MUST maintain the logical flow and arguments of the original document.
-        - YOU MUST respond in language: {language}
+        Return your deep research report without any prefix or suffix to the summary, just your summary without any thinking passages.""" 
 
-        RULES: 
-        - Answer in correct professional terminology and sociolect maintaining exact key terms.
-        - Be precise and comprehensive, focusing on the most important information.
-        - Maintain exact figures, data points, sections and paragraphs as much as possible.
+        # Define summarization templates with separate system and human prompts
+        self.summarize_system_template = """You are a master senior analyst. 
+Your task is to create a deep, detailled (at least 5000 words) research report from information called DOCUMENT given to you, highlighting the most critical insights for decision-makers. 
+In order to do this, YOU MUST analyse the full information provided to you. 
+The DOCUMENT, i.e. the information given to you, can be either a full original document (if the size is not too large) or a collection of ordered document chunks representing a full original document (if the size indeed is large). 
+For the case of ordered document chunks, the order is important to recognize for providing the deep research report as the order marks a consecutive story line.
 
-        Return your summary without any prefix or suffix to the summary, just your summary without any thinking passages.
+KEY POINTS:
+- YOU MUST respond in language: {language}
+- Find out the title (full title of the DOCUMENT) and the rationale of the document and include it in your deep research report.
+- Answer in correct professional terminology and sociolect maintaining exact key terms, figures and data points that underline your research."""
         
-        Chunk to summarize:
-        {text}
-        """
+        self.summarize_human_template = """DOCUMENT as information for deep research report:
+{text}"""
+
+        
+        self.map_system_template = """You are a senior analyst helping the master senior analyst to compile the final summary of a document. 
+In order to help the master senior analyst to compile the final summary of a document, YOU MUST summarize this section of the document in a few paragraphs maintaining all key information. 
+MOST IMPORTANT:
+- Summarize such that the connection to previous document chunks is taken into account.
+- Summarize such that you REDUCE the words count of the original document which is a chunk of a larger document BY A FACTOR OF 3 TO 5.
+- NEVER add any additional information or context that was not present in the original document.
+- Maintain the logical flow and arguments of the original document.
+- Maintain exact figures, data points, sections and paragraphs as much as possible.
+- YOU MUST respond in language: {language}
+
+RULES: 
+- Answer in correct professional terminology and sociolect maintaining exact key terms.
+- Be deep, precise and comprehensive, focusing on the most important information.
+
+Return your summary without any prefix or suffix to the summary, just your summary without any thinking passages."""
+        
+        self.map_human_template = """Chunk to summarize:
+{text}"""
         
         # Initialize chains
         self._initialize_chains()
@@ -152,30 +153,31 @@ class DocumentSummarizer:
             logger.info("Initializing summarization chains")
         
         # Chain for small documents (stuff method)
+        summarize_chat_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(self.summarize_system_template),
+            HumanMessagePromptTemplate.from_template(self.summarize_human_template)
+        ])
+        
         self.stuff_chain = load_summarize_chain(
             self.final_llm,  # Use the main LLM for stuff chain
             chain_type="stuff",
-            prompt=PromptTemplate(
-                input_variables=["text", "language"],
-                template=self.summarize_template
-            ),
+            prompt=summarize_chat_prompt,
             verbose=self.verbose
         )
         
         # Chain for large documents (map-reduce method)
         # Note: This is kept for compatibility but we'll use a custom implementation
         # that allows different LLMs for map and reduce steps
+        map_chat_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(self.map_system_template),
+            HumanMessagePromptTemplate.from_template(self.map_human_template)
+        ])
+        
         self.map_reduce_chain = load_summarize_chain(
             self.final_llm,
             chain_type="map_reduce",
-            map_prompt=PromptTemplate(
-                input_variables=["text", "language"],
-                template=self.map_template
-            ),
-            combine_prompt=PromptTemplate(
-                input_variables=["text", "language"],
-                template=self.summarize_template
-            ),
+            map_prompt=map_chat_prompt,
+            combine_prompt=summarize_chat_prompt,
             verbose=self.verbose
         )
     
@@ -259,24 +261,28 @@ class DocumentSummarizer:
             if self.verbose:
                 logger.info(f"Using {self.chunk_llm.model} for chunk summarization")
                 
+            map_chat_prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(self.map_system_template),
+                HumanMessagePromptTemplate.from_template(self.map_human_template)
+            ])
+            
             map_chain = LLMChain(
                 llm=self.chunk_llm,  # Use chunk LLM for summarizing individual chunks
-                prompt=PromptTemplate(
-                    input_variables=["text", "language"],
-                    template=self.map_template
-                )
+                prompt=map_chat_prompt
             )
             
             # Create combine chain with final_llm (stronger model for final summary)
             if self.verbose:
                 logger.info(f"Using {self.final_llm.model} for final combined summary")
                 
+            summarize_chat_prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(self.summarize_system_template),
+                HumanMessagePromptTemplate.from_template(self.summarize_human_template)
+            ])
+            
             combine_chain = LLMChain(
                 llm=self.final_llm,  # Use final LLM for combining summaries
-                prompt=PromptTemplate(
-                    input_variables=["text", "language"],
-                    template=self.summarize_template
-                )
+                prompt=summarize_chat_prompt
             )
             
             # Create map_reduce chain
