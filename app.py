@@ -255,22 +255,36 @@ if uploaded_file is not None:
                 
                 # Display summary in a container
                 st.subheader("Document Summary")
-                st.markdown("---")
+                st.header("Summary")
                 st.markdown(result["summary"])
-                st.markdown("---")
                 
-                # Display intermediate summaries if available and requested
+                # Display document analysis if available
+                if "analysis" in result and result["analysis"]:
+                    with st.expander("Document Analysis", expanded=True):
+                        analysis = result["analysis"]
+                        st.subheader(f"Document Title: {analysis['title']}")
+                        
+                        st.markdown("### Document Rationale")
+                        st.markdown(analysis['rationale'])
+                        
+                        st.markdown("### Report Structure")
+                        for i, section in enumerate(analysis['structure']):
+                            st.markdown(f"**{i+1}. {section['section']}**: {section['description']}")
+                            if 'subsections' in section:
+                                for j, subsection in enumerate(section['subsections']):
+                                    st.markdown(f"   - **{i+1}.{j+1}. {subsection['subsection']}**: {subsection['description']}")
+                
+                # Display intermediate summaries if requested
                 if save_intermediate and result["intermediate_summaries"]:
-                    with st.expander("Intermediate Chunk Summaries"):
-                        for i, chunk_summary in enumerate(result["intermediate_summaries"]):
-                            st.markdown(f"**Chunk {i+1}**")
-                            st.markdown(chunk_summary)
-                            st.markdown("---")
+                    with st.expander("Intermediate Chunk Summaries", expanded=False):
+                        for i, summary in enumerate(result["intermediate_summaries"]):
+                            st.subheader(f"Chunk {i+1}")
+                            st.markdown(summary)
                             
-                            # Show original chunks if requested
+                            # Show original chunk if requested
                             if show_chunks and result["chunks"] and i < len(result["chunks"]):
-                                with st.expander(f"Original Content - Chunk {i+1}"):
-                                    st.text(result["chunks"][i])
+                                with st.expander("Original Chunk Content", expanded=False):
+                                    st.text(result["chunks"][i][:1000] + "..." if len(result["chunks"][i]) > 1000 else result["chunks"][i])
                 
                 # Create a container for the download button
                 download_col1, download_col2 = st.columns([1, 3])

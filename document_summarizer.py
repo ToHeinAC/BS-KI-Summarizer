@@ -13,7 +13,47 @@ import os
 import time
 import logging
 import argparse
-from typing import Dict, List, Any, Optional
+import json
+from typing import Dict, List, Any, Optional, TypedDict, Annotated, Literal
+
+# LangChain imports
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.llms import Ollama
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.chains.summarize import load_summarize_chain
+from langchain_core.documents import Document
+from langchain_core.callbacks import CallbackManager
+from langchain_core.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+
+# LangGraph imports
+from langgraph.graph import StateGraph, END, START
+# Remove unused imports that are causing issues with newer langgraph versions
+from typing import List, Dict, Any, Sequence, Optional, Union, Callable
+
+# Define state schema for LangGraph workflow
+class DocumentAnalysis(TypedDict):
+    """Schema for document analysis output"""
+    title: str
+    rationale: str
+    structure: List[Dict[str, Any]]
+
+class SummarizerState(TypedDict):
+    """Schema for the summarizer workflow state"""
+    # Input document(s)
+    documents: List[Document]
+    # Chunked documents (if using map-reduce)
+    chunks: Optional[List[Document]]
+    # Intermediate summaries from map step
+    intermediate_summaries: Optional[List[str]]
+    # Document analysis results
+    analysis: Optional[DocumentAnalysis]
+    # Final summary
+    summary: Optional[str]
+    # Method used (stuff or map_reduce)
+    method: Optional[str]
+    # Language for summarization
+    language: str
 
 # LangChain imports
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -121,7 +161,7 @@ KEY POINTS:
 - Find out the title (full title of the DOCUMENT) and the rationale of the document and include it in your deep research report.
 - Answer in correct professional terminology and sociolect maintaining exact key terms, figures and data points that underline your research."""
         
-        self.summarize_human_template = """DOCUMENT as information for deep research report:
+        self.summarize_human_template = """Here is the DOCUMENT for your in-depth research report (at least 5000 words):
 {text}"""
 
         
@@ -143,6 +183,43 @@ Return your summary without any prefix or suffix to the summary, just your summa
         
         self.map_human_template = """Chunk to summarize:
 {text}"""
+        
+        # Analysis step templates
+        self.analysis_system_template = """You are a document analysis expert.
+
+Your task is to analyze the provided document or document summaries and extract key information for structuring a deep research report.
+
+You must perform two critical tasks:
+1. Identify the full title of the document
+2. Analyze the document's rationale and prepare a systematic structure for a deep report
+
+YOUR ANALYSIS MUST BE IN {language}.
+
+You must return your analysis as a valid JSON object with the following structure:
+{
+    "title": "The complete document title",
+    "rationale": "A comprehensive analysis of the document's core purpose, context, and significance",
+    "structure": [
+        {
+            "section": "Section name",
+            "description": "What this section should cover",
+            "subsections": [
+                {
+                    "subsection": "Subsection name",
+                    "description": "What this subsection should cover"
+                }
+            ]
+        }
+    ]
+}
+
+The structure should be detailed and comprehensive, suitable for a deep research report of at least 5000 words.
+"""
+        
+        self.analysis_human_template = """Document to analyze:
+{text}
+
+Provide a structured JSON analysis with the document title, rationale, and a detailed report structure."""
         
         # Initialize chains
         self._initialize_chains()
@@ -180,6 +257,193 @@ Return your summary without any prefix or suffix to the summary, just your summa
             combine_prompt=summarize_chat_prompt,
             verbose=self.verbose
         )
+        
+        # Analysis chain for document structure and title extraction
+        analysis_chat_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(self.analysis_system_template),
+            HumanMessagePromptTemplate.from_template(self.analysis_human_template)
+        ])
+        
+        self.analysis_chain = analysis_chat_prompt | self.final_llm
+    
+    def _map_step(self, state: SummarizerState) -> SummarizerState:
+        """Map step: Process individual document chunks."""
+        if self.verbose:
+            logger.info("Starting map step for document chunks")
+        
+        # Get documents from state
+        documents = state["documents"]
+        language = state["language"]
+        
+        # Split documents into chunks
+        split_docs = self.text_splitter.split_documents(documents)
+        
+        if self.verbose:
+            logger.info(f"Split into {len(split_docs)} chunks")
+        
+        # Process each chunk with map chain
+        intermediate_summaries = []
+        for doc in split_docs:
+            response = self.chunk_llm.invoke(
+                self.map_chat_prompt.format_messages(
+                    text=doc.page_content,
+                    language=language
+                )
+            )
+            # Handle both string and AIMessage responses
+            result = response.content if hasattr(response, 'content') else response
+            intermediate_summaries.append(result)
+        
+        # Update state
+        return {
+            **state,
+            "chunks": split_docs,
+            "intermediate_summaries": intermediate_summaries
+        }
+    
+    def _analysis_step(self, state: SummarizerState) -> SummarizerState:
+        """Analysis step: Extract document title and prepare report structure."""
+        if self.verbose:
+            logger.info("Starting analysis step for document structure")
+        
+        language = state["language"]
+        method = state["method"]
+        
+        # Determine what text to analyze based on method
+        if method == "stuff":
+            # For small documents, analyze the original text
+            text_to_analyze = "\n\n".join([doc.page_content for doc in state["documents"]])
+        else:
+            # For map-reduce, analyze the intermediate summaries
+            text_to_analyze = "\n\n".join(state["intermediate_summaries"])
+        
+        # Run analysis chain
+        analysis_result = self.analysis_chain.invoke({
+            "text": text_to_analyze,
+            "language": language
+        })
+        
+        # Parse JSON output
+        try:
+            # Extract JSON from potential text wrapper
+            json_str = analysis_result
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "{" in json_str and "}" in json_str:
+                # Find the first { and last }
+                start = json_str.find("{")
+                end = json_str.rfind("}")+1
+                json_str = json_str[start:end]
+                
+            analysis_data = json.loads(json_str)
+            
+            # Ensure required fields are present
+            if not all(k in analysis_data for k in ["title", "rationale", "structure"]):
+                raise ValueError("Missing required fields in analysis output")
+                
+            # Create DocumentAnalysis object
+            analysis = DocumentAnalysis(
+                title=analysis_data["title"],
+                rationale=analysis_data["rationale"],
+                structure=analysis_data["structure"]
+            )
+            
+            if self.verbose:
+                logger.info(f"Analysis complete. Document title: {analysis['title']}")
+            
+            # Update state
+            return {**state, "analysis": analysis}
+            
+        except Exception as e:
+            logger.error(f"Error parsing analysis result: {e}")
+            logger.error(f"Raw analysis result: {analysis_result}")
+            
+            # Create a default analysis object
+            analysis = DocumentAnalysis(
+                title="Unknown Document Title",
+                rationale="Unable to extract document rationale",
+                structure=[{"section": "Main Content", "description": "Document content"}]
+            )
+            
+            return {**state, "analysis": analysis}
+    
+    def _final_report_step(self, state: SummarizerState) -> SummarizerState:
+        """Final report step: Generate the final report using analysis structure."""
+        if self.verbose:
+            logger.info("Starting final report generation")
+        
+        language = state["language"]
+        method = state["method"]
+        analysis = state["analysis"]
+        
+        # Create an enhanced prompt that incorporates the analysis
+        enhanced_system_template = f"""{self.summarize_system_template}
+
+IMPORTANT ADDITIONAL INSTRUCTIONS:
+- The document title is: {analysis['title']}
+- Document rationale: {analysis['rationale']}
+- Follow this specific structure for your report:"""
+        
+        # Add the structure to the prompt
+        for i, section in enumerate(analysis["structure"]):
+            enhanced_system_template += f"\n{i+1}. {section['section']}: {section['description']}"
+            if "subsections" in section:
+                for j, subsection in enumerate(section["subsections"]):
+                    enhanced_system_template += f"\n   {i+1}.{j+1}. {subsection['subsection']}: {subsection['description']}"
+        
+        # Create enhanced prompt
+        enhanced_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(enhanced_system_template),
+            HumanMessagePromptTemplate.from_template(self.summarize_human_template)
+        ])
+        
+        # Generate final report based on method
+        if method == "stuff":
+            # For small documents
+            text_to_summarize = "\n\n".join([doc.page_content for doc in state["documents"]])
+        else:
+            # For map-reduce, use intermediate summaries
+            text_to_summarize = "\n\n".join(state["intermediate_summaries"])
+        
+        # Generate final report
+        final_response = self.final_llm.invoke(
+            enhanced_prompt.format_messages(
+                text=text_to_summarize,
+                language=language
+            )
+        )
+        # Handle both string and AIMessage responses
+        final_report = final_response.content if hasattr(final_response, 'content') else final_response
+        
+        # Update state
+        return {**state, "summary": final_report}
+    
+    def _create_workflow(self) -> Any:
+        """Create the LangGraph workflow for document summarization."""
+        # Create workflow graph
+        workflow = StateGraph(SummarizerState)
+        
+        # Add nodes
+        workflow.add_node("map", self._map_step)
+        workflow.add_node("analysis_node", self._analysis_step)
+        workflow.add_node("final_report", self._final_report_step)
+        
+        # Add edges
+        # For map-reduce method
+        workflow.add_edge("map", "analysis_node")
+        workflow.add_edge("analysis_node", "final_report")
+        
+        # For stuff method (skip map step)
+        workflow.add_conditional_edges(
+            START,
+            lambda state: "analysis_node" if state["method"] == "stuff" else "map"
+        )
+        
+        # End after final report
+        workflow.add_edge("final_report", END)
+        
+        # Compile workflow
+        return workflow.compile()
     
     def load_document(self, file_path: str) -> List[Document]:
         """Load a document from a file path.
@@ -207,7 +471,7 @@ Return your summary without any prefix or suffix to the summary, just your summa
         return docs
     
     def summarize(self, documents: List[Document], progress_callback=None, on_final_start=None, on_final_complete=None) -> Dict[str, Any]:
-        """Summarize the provided documents.
+        """Summarize the provided documents using LangGraph workflow.
         
         Args:
             documents: List of Document objects to summarize
@@ -220,179 +484,150 @@ Return your summary without any prefix or suffix to the summary, just your summa
         """
         start_time = time.time()
         
+        # Store callbacks for later use
+        self.progress_callback = progress_callback
+        self.on_final_start = on_final_start
+        self.on_final_complete = on_final_complete
+        
         # Calculate total document size
         total_chars = sum(len(doc.page_content) for doc in documents)
         if self.verbose:
             logger.info(f"Document size: {total_chars} characters")
         
-        # Choose appropriate chain based on document size
-        if total_chars < 10000:  # Small document threshold
-            if self.verbose:
-                logger.info("Document is small. Using 'stuff' chain.")
-            result = self.stuff_chain.invoke({
-                "input_documents": documents,
-                "language": self.language
-            })
-            
-            return {
-                "summary": result["output_text"],
-                "method": "stuff",
-                "intermediate_summaries": None,
-                "chunks": None
-            }
-        else:
-            if self.verbose:
-                logger.info(f"Document is large ({total_chars} chars). Using map_reduce chain.")
-                logger.info("Splitting document into chunks...")
-            
-            # Split documents for map-reduce
-            split_docs = self.text_splitter.split_documents(documents)
-            
-            if self.verbose:
-                logger.info(f"Split into {len(split_docs)} chunks")
-                logger.info("Starting map-reduce summarization...")
-            
-            # Create map chain to access intermediate results
-            from langchain.chains.combine_documents.map_reduce import MapReduceDocumentsChain
-            from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-            from langchain.chains.llm import LLMChain
-            
-            # Create map chain with chunk_llm (lighter model for individual chunks)
-            if self.verbose:
-                logger.info(f"Using {self.chunk_llm.model} for chunk summarization")
-                
-            map_chat_prompt = ChatPromptTemplate.from_messages([
+        # Determine method based on document size
+        method = "stuff" if total_chars < 10000 else "map_reduce"
+        
+        if self.verbose:
+            logger.info(f"Using {method} method for document summarization")
+        
+        # Initialize map_chat_prompt if it doesn't exist yet
+        if not hasattr(self, "map_chat_prompt"):
+            self.map_chat_prompt = ChatPromptTemplate.from_messages([
                 SystemMessagePromptTemplate.from_template(self.map_system_template),
                 HumanMessagePromptTemplate.from_template(self.map_human_template)
             ])
+        
+        # Create LangGraph workflow if not already created
+        if not hasattr(self, "workflow"):
+            self.workflow = self._create_workflow()
+        
+        # Initialize state
+        initial_state = SummarizerState(
+            documents=documents,
+            chunks=None,
+            intermediate_summaries=None,
+            analysis=None,
+            summary=None,
+            method=method,
+            language=self.language
+        )
+        
+        # Execute workflow
+        if self.verbose:
+            logger.info("Starting LangGraph workflow for document summarization")
+        
+        try:
+            # Run the workflow
+            final_state = self.workflow.invoke(initial_state)
             
-            map_chain = LLMChain(
-                llm=self.chunk_llm,  # Use chunk LLM for summarizing individual chunks
-                prompt=map_chat_prompt
-            )
-            
-            # Create combine chain with final_llm (stronger model for final summary)
-            if self.verbose:
-                logger.info(f"Using {self.final_llm.model} for final combined summary")
-                
-            summarize_chat_prompt = ChatPromptTemplate.from_messages([
-                SystemMessagePromptTemplate.from_template(self.summarize_system_template),
-                HumanMessagePromptTemplate.from_template(self.summarize_human_template)
-            ])
-            
-            combine_chain = LLMChain(
-                llm=self.final_llm,  # Use final LLM for combining summaries
-                prompt=summarize_chat_prompt
-            )
-            
-            # Create map_reduce chain
-            map_reduce_chain = MapReduceDocumentsChain(
-                llm_chain=map_chain,
-                combine_document_chain=StuffDocumentsChain(
-                    llm_chain=combine_chain,
-                    document_variable_name="text"
-                ),
-                document_variable_name="text",
-                return_intermediate_steps=True  # This is key to get intermediate summaries
-            )
-            
-            # If we have a progress callback, we'll need to track progress manually
-            if progress_callback:
-                total_chunks = len(split_docs)
-                processed_chunks = 0
-                
-                # Define a custom map function that updates progress
-                def map_with_progress(docs):
-                    nonlocal processed_chunks
-                    results = []
-                    
-                    for doc in docs:
-                        # Process the document with the map chain
-                        result = map_chain.invoke({
-                            "text": doc.page_content,
-                            "language": self.language
-                        })["text"]
-                        
-                        # Update progress
-                        processed_chunks += 1
-                        progress_callback(processed_chunks, total_chunks)
-                        
-                        # Store the result
-                        results.append(result)
-                    
-                    return results
-                
-                # Process documents with progress tracking
-                intermediate_steps = map_with_progress(split_docs)
-                
-                # Notify that we're starting the final summary step
-                if on_final_start:
-                    on_final_start()
-                    
-                # Combine the results
-                combined_docs = [Document(page_content=text) for text in intermediate_steps]
-                final_result = combine_chain.invoke({
-                    "text": "\n\n".join([doc.page_content for doc in combined_docs]),
-                    "language": self.language
-                })["text"]
-                
-                # Notify that we've completed the final summary step
-                if on_final_complete:
-                    on_final_complete()
-                
-                # Create a result object similar to what map_reduce_chain would return
-                result = {
-                    "output_text": final_result,
-                    "intermediate_steps": intermediate_steps
-                }
-            else:
-                # Process with standard map-reduce if no progress callback
-                # But still notify about the final summary step if callbacks are provided
-                
-                # First run the map step to get intermediate summaries
-                intermediate_steps = []
-                for doc in split_docs:
-                    result = map_chain.invoke({
-                        "text": doc.page_content,
-                        "language": self.language
-                    })["text"]
-                    intermediate_steps.append(result)
-                
-                # Notify that we're starting the final summary step
-                if on_final_start:
-                    on_final_start()
-                
-                # Combine the results
-                combined_docs = [Document(page_content=text) for text in intermediate_steps]
-                final_result = combine_chain.invoke({
-                    "text": "\n\n".join([doc.page_content for doc in combined_docs]),
-                    "language": self.language
-                })["text"]
-                
-                # Notify that we've completed the final summary step
-                if on_final_complete:
-                    on_final_complete()
-                    
-                # Create a result object similar to what map_reduce_chain would return
-                result = {
-                    "output_text": final_result,
-                    "intermediate_steps": intermediate_steps
-                }
-            
-            # Extract intermediate summaries
-            intermediate_summaries = result.get("intermediate_steps", [])
+            # Extract results
+            summary = final_state["summary"]
+            analysis = final_state["analysis"]
+            chunks = final_state.get("chunks")
+            intermediate_summaries = final_state.get("intermediate_summaries")
             
             end_time = time.time()
             if self.verbose:
                 logger.info(f"Summarization completed in {end_time - start_time:.2f} seconds")
-                logger.info(f"Generated {len(intermediate_summaries)} intermediate summaries")
+                if intermediate_summaries:
+                    logger.info(f"Generated {len(intermediate_summaries)} intermediate summaries")
+                logger.info(f"Document title identified: {analysis['title']}")
             
+            # Notify that we've completed the final summary step
+            if self.on_final_complete:
+                self.on_final_complete()
+            
+            # Return results in the same format as before for compatibility
             return {
-                "summary": result["output_text"],
-                "method": "map_reduce",
+                "summary": summary,
+                "method": method,
                 "intermediate_summaries": intermediate_summaries,
-                "chunks": [doc.page_content for doc in split_docs]
+                "chunks": [doc.page_content for doc in chunks] if chunks else None,
+                "analysis": analysis
             }
+            
+        except Exception as e:
+            logger.error(f"Error in LangGraph workflow: {e}")
+            
+            # Fall back to the old implementation
+            if self.verbose:
+                logger.info("Falling back to traditional implementation")
+            
+            if method == "stuff":
+                result = self.stuff_chain.invoke({
+                    "input_documents": documents,
+                    "language": self.language
+                })
+                
+                return {
+                    "summary": result["output_text"],
+                    "method": "stuff",
+                    "intermediate_summaries": None,
+                    "chunks": None,
+                    "analysis": None
+                }
+            else:
+                # Use the old map-reduce implementation
+                # This is a simplified version of the original code
+                split_docs = self.text_splitter.split_documents(documents)
+                
+                # Map step
+                intermediate_steps = []
+                for i, doc in enumerate(split_docs):
+                    response = self.chunk_llm.invoke(
+                        self.map_chat_prompt.format_messages(
+                            text=doc.page_content,
+                            language=self.language
+                        )
+                    )
+                    # Handle both string and AIMessage responses
+                    result = response.content if hasattr(response, 'content') else response
+                    intermediate_steps.append(result)
+                    
+                    # Update progress if callback provided
+                    if self.progress_callback:
+                        self.progress_callback(i + 1, len(split_docs))
+                
+                # Notify that we're starting the final summary step
+                if self.on_final_start:
+                    self.on_final_start()
+                
+                # Combine step
+                summarize_chat_prompt = ChatPromptTemplate.from_messages([
+                    SystemMessagePromptTemplate.from_template(self.summarize_system_template),
+                    HumanMessagePromptTemplate.from_template(self.summarize_human_template)
+                ])
+                
+                final_response = self.final_llm.invoke(
+                    summarize_chat_prompt.format_messages(
+                        text="\n\n".join(intermediate_steps),
+                        language=self.language
+                    )
+                )
+                # Handle both string and AIMessage responses
+                final_result = final_response.content if hasattr(final_response, 'content') else final_response
+                
+                # Notify that we've completed the final summary step
+                if self.on_final_complete:
+                    self.on_final_complete()
+                
+                return {
+                    "summary": final_result,
+                    "method": "map_reduce",
+                    "intermediate_summaries": intermediate_steps,
+                    "chunks": [doc.page_content for doc in split_docs],
+                    "analysis": None
+                }
 
 
 def main():
@@ -496,6 +731,22 @@ def main():
         print("=" * 80)
         print(summary)
         print("=" * 80)
+        
+        # Print document analysis if available
+        if "analysis" in result and result["analysis"]:
+            analysis = result["analysis"]
+            print("\n" + "=" * 80)
+            print("DOCUMENT ANALYSIS:")
+            print("=" * 80)
+            print(f"Title: {analysis['title']}")
+            print("\nRationale:")
+            print(analysis['rationale'])
+            print("\nStructure:")
+            for i, section in enumerate(analysis['structure']):
+                print(f"\n{i+1}. {section['section']}: {section['description']}")
+                if 'subsections' in section:
+                    for j, subsection in enumerate(section['subsections']):
+                        print(f"   {i+1}.{j+1}. {subsection['subsection']}: {subsection['description']}")
         
         # Print intermediate summaries if available
         if result["method"] == "map_reduce" and result["intermediate_summaries"]:
